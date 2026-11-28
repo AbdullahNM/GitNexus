@@ -36,6 +36,7 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { pathToFileURL } from 'node:url';
 import { getRemoteOriginUrl } from '../../src/storage/git.js';
 import { getGlobalDir } from '../../src/storage/repo-manager.js';
 
@@ -1879,6 +1880,126 @@ describe('git-clone', () => {
         expect(result).toBeNull();
       } finally {
         await fs.rm(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe.skipIf(process.platform !== 'win32')('native Windows long-path refresh', () => {
+    it.each([
+      { mode: 'default', branch: undefined, system: 'disabled' },
+      { mode: 'branch-pinned using NUL system config', branch: 'main', system: 'nul' },
+      { mode: 'default using system config', branch: undefined, system: 'file' },
+    ])(
+      'refreshes a $mode checkout with global long paths disabled',
+      async ({ branch, system }) => {
+        const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'gnx-refresh-')));
+        const source = path.join(root, 'source');
+        const cloneRoot = path.join(root, 'p'.repeat(120));
+        const target = path.join(cloneRoot, 'repo');
+        const relativeFile = path.join('a'.repeat(56), 'b'.repeat(56), 'c'.repeat(54) + '.ts');
+        const targetFile = path.join(target, relativeFile);
+        const config = path.join(root, 'gitconfig');
+        const systemConfig = system === 'nul' ? 'NUL' : path.join(root, 'system.gitconfig');
+        const remote = 'https://example.com/repo.git';
+        const rewrite = `[url "${pathToFileURL(source).href}"]\n  insteadOf = ${remote}\n`;
+        const settings = [
+          '[user]',
+          '  name = GitNexus Test',
+          '  email = test@example.invalid',
+          system === 'file' ? '' : rewrite,
+        ].join('\n');
+        const systemSettings =
+          system === 'file'
+            ? '[core]\n  longpaths = false\n[include]\n  path = ./rewrite.gitconfig\n'
+            : '[invalid config ignored when system config is disabled';
+        vi.stubEnv('GIT_CONFIG_GLOBAL', config);
+        vi.stubEnv('GIT_CONFIG_SYSTEM', systemConfig);
+        vi.stubEnv('GIT_CONFIG_NOSYSTEM', system === 'disabled' ? '1' : '0');
+        vi.stubEnv('GIT_ALLOW_PROTOCOL', 'file');
+        const commit = async (contents: string): Promise<string> => {
+          await fs.writeFile(path.join(source, relativeFile), contents);
+          await runGit(['-c', 'core.longpaths=true', 'add', '--', relativeFile], source);
+          await runGit(['-c', 'commit.gpgsign=false', 'commit', '-m', contents], source);
+          return (await runGit(['rev-parse', 'HEAD'], source)).trim();
+        };
+
+        try {
+          expect(targetFile.length).toBeGreaterThan(300);
+          await fs.mkdir(path.dirname(path.join(source, relativeFile)), { recursive: true });
+          await fs.writeFile(config, settings);
+          if (system !== 'nul') await fs.writeFile(systemConfig, systemSettings);
+          if (system === 'file') await fs.writeFile(path.join(root, 'rewrite.gitconfig'), rewrite);
+          await runGit(['init', '--initial-branch=main', source], root);
+          const initial = await commit('initial');
+          const options = { allowedCloneRoot: cloneRoot, expectedRepoName: 'repo', branch };
+          await expect(cloneOrPull(remote, target, undefined, options)).resolves.toBe(target);
+          expect((await runGit(['rev-parse', 'HEAD'], target)).trim()).toBe(initial);
+          expect(await fs.readFile(targetFile, 'utf8')).toBe('initial');
+
+          const disabledConfig = `${settings}\n[core]\n  longpaths = false\n`;
+          await fs.writeFile(config, disabledConfig);
+          const refreshed = await commit('upstream update');
+          await expect(cloneOrPull(remote, target, undefined, options)).resolves.toBe(target);
+          expect((await runGit(['rev-parse', 'HEAD'], target)).trim()).toBe(refreshed);
+          expect(await fs.readFile(targetFile, 'utf8')).toBe('upstream update');
+
+          await fs.writeFile(targetFile, 'local edit');
+          await commit('conflicting upstream update');
+          await expect(cloneOrPull(remote, target, undefined, options)).rejects.toThrow(
+            branch ? /git checkout failed/ : /git pull failed/,
+          );
+          expect((await runGit(['rev-parse', 'HEAD'], target)).trim()).toBe(refreshed);
+          expect(await fs.readFile(targetFile, 'utf8')).toBe('local edit');
+          expect(await fs.readFile(config, 'utf8')).toBe(disabledConfig);
+          if (system !== 'nul')
+            expect(await fs.readFile(systemConfig, 'utf8')).toBe(systemSettings);
+          await expect(
+            runGit(['config', '--local', '--get', 'core.longpaths'], target),
+          ).rejects.toThrow(/failed \(1\)/);
+        } finally {
+          vi.unstubAllEnvs();
+          await fs.rm(root, { recursive: true, force: true });
+        }
+      },
+      30000,
+    );
+
+    it('still runs Git when the temporary config directory is unavailable', async () => {
+      const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'gnx-no-config-')));
+      try {
+        vi.stubEnv('GIT_CONFIG_GLOBAL', path.join(root, 'missing-global'));
+        vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+        await runGit(['init', '--initial-branch=main'], root);
+        // A regular file as TEMP makes the config setup fail even if the runner is an admin.
+        const tempFile = path.join(root, 'temp-file');
+        await fs.writeFile(tempFile, '');
+        vi.stubEnv('TEMP', tempFile);
+        await expect(runGitForTest(['status', '--porcelain'], root)).resolves.toBe(
+          '?? temp-file\n',
+        );
+      } finally {
+        vi.unstubAllEnvs();
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('does not start the worktree command after the config preparation budget expires', async () => {
+      const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'gnx-git-timeout-')));
+      try {
+        vi.stubEnv('GIT_CONFIG_GLOBAL', path.join(root, 'missing-global'));
+        vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+        await runGit(['init', '--initial-branch=main'], root);
+        const clock = vi.spyOn(performance, 'now').mockReturnValue(6000).mockReturnValueOnce(0);
+        try {
+          await expect(
+            runGitForTest(['status', '--porcelain'], root, { timeoutMs: 5000 }),
+          ).rejects.toThrow('git status timed out after 5000ms');
+        } finally {
+          clock.mockRestore();
+        }
+      } finally {
+        vi.unstubAllEnvs();
+        await fs.rm(root, { recursive: true, force: true });
       }
     });
   });

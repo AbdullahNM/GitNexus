@@ -5,10 +5,11 @@
  * If already cloned, does git pull instead.
  */
 
-import { spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
 import os from 'node:os';
+import { promisify } from 'node:util';
 import { logger } from '../core/logger.js';
 import { getGlobalDir } from '../storage/repo-manager.js';
 import { branchSlug } from '../storage/branch-index.js';
@@ -941,6 +942,63 @@ export function buildGitEnv(
   return env;
 }
 
+const execFileAsync = promisify(execFile);
+
+async function withWindowsLongPaths(
+  cwd: string | undefined,
+  timeoutMs: number | undefined,
+  env: NodeJS.ProcessEnv,
+  run: (env: NodeJS.ProcessEnv) => Promise<string>,
+): Promise<string> {
+  let systemConfig = '';
+  try {
+    const { stdout } = await execFileAsync('git', ['var', 'GIT_CONFIG_SYSTEM'], {
+      cwd,
+      env: buildGitEnv(process.env),
+      windowsHide: true,
+      timeout: timeoutMs && timeoutMs > 0 ? Math.min(timeoutMs, 5000) : 5000,
+    });
+    systemConfig = stdout.replace(/\r?\n$/, '');
+  } catch (error) {
+    // Exit 1 with no error output means the system scope is disabled. Older Git
+    // versions without this variable retain the command-line override.
+    const result = error as { code?: number | string; stderr?: string };
+    if (result.code !== 1 || result.stderr) return run(env);
+  }
+
+  // On Git for Windows, -c alone can leave refresh using short-path handling.
+  // Set longpaths in the earliest config scope and include its original file.
+  // A null device has no settings to include and must keep its special meaning.
+  const includeSystemConfig =
+    systemConfig &&
+    systemConfig !== '/dev/null' &&
+    path.basename(systemConfig).toLowerCase() !== 'nul';
+  let config: string | undefined;
+  let childEnv = env;
+  try {
+    config = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-git-')), 'gitconfig');
+    const include = includeSystemConfig
+      ? `[include]\n\tpath = ${JSON.stringify(path.resolve(cwd ?? process.cwd(), systemConfig).replace(/\\/g, '/'))}\n`
+      : '';
+    await fs.writeFile(config, `[core]\n\tlongpaths = true\n${include}`, { flag: 'wx' });
+    childEnv = { ...env, GIT_CONFIG_SYSTEM: config, GIT_CONFIG_NOSYSTEM: '0' };
+  } catch {
+    logger.warn('Could not prepare the temporary Git for Windows configuration');
+  }
+  try {
+    return await run(childEnv);
+  } finally {
+    if (config) {
+      try {
+        await fs.rm(config, { force: true });
+        await fs.rmdir(path.dirname(config));
+      } catch {
+        logger.warn('Could not remove the temporary Git for Windows configuration');
+      }
+    }
+  }
+}
+
 // `options` carries the inputs the credential resolver needs: a per-request
 // GitHub `token` and the clone `url`. buildGitEnv injects at most ONE
 // host-scoped Authorization header (GitHub PAT for github.com, else the
@@ -952,73 +1010,86 @@ export function runGit(args: string[], cwd?: string, options?: RunGitOptions): P
     process.platform === 'win32' &&
     ['clone', 'pull', 'checkout', 'status', 'clean'].includes(args[0]);
   const gitArgs = windowsWorktreeCommand ? ['-c', 'core.longpaths=true', ...args] : args;
-  return new Promise((resolve, reject) => {
-    const spawnGit = options?.spawnForTest ?? spawn;
-    const proc = spawnGit('git', gitArgs, {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-      env: buildGitEnv(process.env, options),
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    let timedOut = false;
-    let killTimer: NodeJS.Timeout | undefined;
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      fn();
-    };
-    const timer =
-      options?.timeoutMs && options.timeoutMs > 0
-        ? setTimeout(() => {
-            timedOut = true;
-            proc.kill('SIGTERM');
-            killTimer = setTimeout(() => {
-              proc.kill('SIGKILL');
-              finish(() =>
-                reject(new Error(`git ${args[0]} timed out after ${options.timeoutMs}ms`)),
-              );
-            }, options.timeoutKillGraceMs ?? 1_000);
-          }, options.timeoutMs)
-        : undefined;
-    proc.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk;
-    });
-    proc.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk;
-    });
-
-    proc.on('close', (code) => {
-      if (timedOut) {
-        finish(() => reject(new Error(`git ${args[0]} timed out after ${options?.timeoutMs}ms`)));
+  const timeoutMs = options?.timeoutMs;
+  const deadline = timeoutMs && timeoutMs > 0 ? performance.now() + timeoutMs : undefined;
+  const timeoutError = () => new Error(`git ${args[0]} timed out after ${timeoutMs}ms`);
+  const run = (env: NodeJS.ProcessEnv) =>
+    new Promise<string>((resolve, reject) => {
+      // Count Windows config discovery and preparation against the same Git budget.
+      const remaining =
+        deadline === undefined ? undefined : Math.ceil(deadline - performance.now());
+      if (remaining !== undefined && remaining <= 0) {
+        reject(timeoutError());
         return;
       }
-      if (code === 0) finish(() => resolve(stdout));
-      else {
-        // Log full stderr internally but don't expose it to API callers (SSRF mitigation)
-        if (stderr.trim()) logger.error(`git ${args[0]} stderr: ${stderr.trim()}`);
-        const failure = `git ${args[0]} failed (exit code ${code})`;
-        const longPathError =
-          windowsWorktreeCommand &&
-          /^(?:error: unable to create file|fatal: cannot create directory at) [^\r\n]+: Filename too long\r?$/m.test(
-            stderr,
-          );
-        const message = longPathError
-          ? `${failure}: Filename too long. For web imports, shorten GITNEXUS_HOME and restart the server. For auto-sync, shorten the project's localPath and retry.`
-          : failure;
-        finish(() => reject(new Error(message)));
-      }
-    });
+      const spawnGit = options?.spawnForTest ?? spawn;
+      const proc = spawnGit('git', gitArgs, {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env,
+      });
 
-    proc.on('error', (err) => {
-      finish(() => reject(new Error(`Failed to spawn git: ${err.message}`)));
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      let timedOut = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        fn();
+      };
+      const timer =
+        remaining !== undefined
+          ? setTimeout(() => {
+              timedOut = true;
+              proc.kill('SIGTERM');
+              killTimer = setTimeout(() => {
+                proc.kill('SIGKILL');
+                finish(() => reject(timeoutError()));
+              }, options?.timeoutKillGraceMs ?? 1_000);
+            }, remaining)
+          : undefined;
+      proc.stdout?.on('data', (chunk: Buffer) => {
+        stdout += chunk;
+      });
+      proc.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk;
+      });
+
+      proc.on('close', (code) => {
+        if (timedOut) {
+          finish(() => reject(timeoutError()));
+          return;
+        }
+        if (code === 0) finish(() => resolve(stdout));
+        else {
+          // Log full stderr internally but don't expose it to API callers (SSRF mitigation)
+          if (stderr.trim()) logger.error(`git ${args[0]} stderr: ${stderr.trim()}`);
+          const failure = `git ${args[0]} failed (exit code ${code})`;
+          const longPathError =
+            windowsWorktreeCommand &&
+            /^(?:error: unable to create file|fatal: cannot create directory at) [^\r\n]+: Filename too long\r?$/m.test(
+              stderr,
+            );
+          const message = longPathError
+            ? `${failure}: Filename too long. For web imports, shorten GITNEXUS_HOME and restart the server. For auto-sync, shorten the project's localPath and retry.`
+            : failure;
+          finish(() => reject(new Error(message)));
+        }
+      });
+
+      proc.on('error', (err) => {
+        finish(() => reject(new Error(`Failed to spawn git: ${err.message}`)));
+      });
     });
-  });
+  const env = buildGitEnv(process.env, options);
+  return windowsWorktreeCommand && !options?.spawnForTest
+    ? withWindowsLongPaths(cwd, timeoutMs, env, run)
+    : run(env);
 }
 
 export const runGitForTest = runGit;
